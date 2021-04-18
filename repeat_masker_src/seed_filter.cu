@@ -11,7 +11,7 @@
 #include "store.h"
 #include "store_gpu.h"
 
-// Each segmentPair is 16B
+// Each segment is 16B
 // With 64MB for the HSPs array per 1GB GPU memory
 // With higher GPU memory, the size just linearly increases
 
@@ -26,9 +26,7 @@ int xdrop;
 int hspthresh;
 bool noentropy;
 
-char** d_query_seq;
-char** d_query_rc_seq;
-uint32_t query_length[BUFFER_DEPTH];
+char** d_seq_rc;
 
 uint64_t** d_seed_offsets;
 
@@ -43,15 +41,15 @@ std::vector<thrust::device_vector<segmentPair> > d_hsp_vec;
 
 segmentPair** d_hsp_reduced;
 std::vector<thrust::device_vector<segmentPair> > d_hsp_reduced_vec;
-
-struct hspEqual{
+	 
+struct hspDiagEqual{
     __host__ __device__
         bool operator()(segmentPair x, segmentPair y){
-            return ( ( (x.ref_start - x.query_start) == (y.ref_start - y.query_start) ) &&  ( ( (x.ref_start >= y.ref_start) && ( (x.ref_start + x.len) <= (y.ref_start + y.len) )  ) || ( ( y.ref_start >= x.ref_start ) && ( (y.ref_start + y.len) <= (x.ref_start + x.len) ) ) ) );
+        return ( ( (x.ref_start - x.query_start) == (y.ref_start - y.query_start) ) &&  ( ( (x.ref_start >= y.ref_start) && ( (x.ref_start + x.len) <= (y.ref_start + y.len) )  ) || ( ( y.ref_start >= x.ref_start ) && ( (y.ref_start + y.len) <= (x.ref_start + x.len) ) ) ) );
     }
 };
 
-struct hspComp{
+struct hspDiagComp{
     __host__ __device__
         bool operator()(segmentPair x, segmentPair y){
             if((x.ref_start - x.query_start) < (y.ref_start - y.query_start))
@@ -60,9 +58,9 @@ struct hspComp{
                 if(x.ref_start < y.ref_start)
                     return true;
                 else if(x.ref_start == y.ref_start){
-                    if(x.len < y.len)
+                    if(x.query_start < y.query_start)
                         return true;
-                    else if(x.len == y.len){
+                    else if(x.query_start == y.query_start){
                         if(x.score > y.score)
                             return true;
                         else
@@ -74,13 +72,70 @@ struct hspComp{
                 else
                     return false;
             }
+            else 
+                return false;
+    }
+};
+
+struct hspEqual{
+    __host__ __device__
+        bool operator()(segmentPair x, segmentPair y){
+        return ((x.ref_start == y.ref_start) && (x.query_start == y.query_start) && (x.len == y.len) && (x.score == y.score));
+    }
+};
+
+struct hspFinalComp{
+    __host__ __device__
+        bool operator()(segmentPair x, segmentPair y){
+            if(x.query_start < y.query_start)
+                return true;
+            else if(x.query_start == y.query_start){
+                if(x.score > y.score)
+                    return true;
+                else if(x.score == y.score){
+                    if(x.ref_start > y.ref_start)
+                        return true;
+                    else
+                        return false;
+                }
+                else
+                    return false;
+            }
             else
                 return false;
     }
 };
 
+struct hspComp{
+    __host__ __device__
+        bool operator()(segmentPair x, segmentPair y){
+            if(x.query_start < y.query_start)
+                return true;
+            else if(x.query_start == y.query_start){
+                if(x.len > y.len)
+                    return true;
+                else if(x.len == y.len){
+                    if(x.ref_start < y.ref_start)
+                        return true;
+                    else if(x.ref_start == y.ref_start){
+                        if(x.score > y.score)
+                            return true;
+                        else
+                            return false;
+                    }
+                    else
+                        return false;
+                }
+                else
+                    return false;
+            }
+            else 
+                return false;
+    }
+};
+
 __global__
-void compress_string_rev_comp (uint32_t len, char* src_seq, char* dst_seq, char* dst_seq_rc){ 
+void rev_comp_string (uint32_t len, char* src_seq, char* dst_seq){ 
     int thread_id = threadIdx.x;
     int block_dim = blockDim.x;
     int grid_dim = gridDim.x;
@@ -91,38 +146,23 @@ void compress_string_rev_comp (uint32_t len, char* src_seq, char* dst_seq, char*
 
     for (uint32_t i = start; i < len; i += stride) {
         char ch = src_seq[i];
-        char dst = X_NT;
         char dst_rc = X_NT;
-        if (ch == 'A'){
-            dst = A_NT;
+        if (ch == A_NT){
             dst_rc = T_NT;
         }
-        else if (ch == 'C'){ 
-            dst = C_NT;
+        else if (ch == C_NT){ 
             dst_rc = G_NT;
         }
-        else if (ch == 'G'){
-            dst = G_NT;
+        else if (ch == G_NT){
             dst_rc = C_NT;
         }
-        else if (ch == 'T'){
-            dst = T_NT;
+        else if (ch == T_NT){
             dst_rc = A_NT;
         }
-        else if ((ch == 'a') || (ch == 'c') || (ch == 'g') || (ch == 't')){
-            dst = L_NT;
-            dst_rc = L_NT;
+        else {
+            dst_rc = ch;
         }
-        else if ((ch == 'n') || (ch == 'N')){
-            dst = N_NT;
-            dst_rc = N_NT;
-        }
-        else if (ch == '&'){
-            dst = E_NT;
-            dst_rc = E_NT;
-        }
-        dst_seq[i] = dst;
-        dst_seq_rc[len -1 -i] = dst_rc;
+        dst_seq[len -1 -i] = dst_rc;
     }
 }
 
@@ -154,7 +194,7 @@ void find_num_hits (int num_seeds, const uint32_t* __restrict__ d_index_table, u
 }
 
 __global__
-void find_hits (const uint32_t* __restrict__  d_index_table, const uint32_t* __restrict__ d_pos_table, uint64_t*  d_seed_offsets, uint32_t seed_size, uint32_t* seed_hit_num, int num_hits, segmentPair* d_hsp, uint32_t start_seed_index, uint32_t start_hit_index){
+void find_hits (const uint32_t* __restrict__  d_index_table, const uint32_t* __restrict__ d_pos_table, uint64_t*  d_seed_offsets, uint32_t seed_size, uint32_t* seed_hit_num, int num_hits, segmentPair* d_hsp, uint32_t start_seed_index, uint32_t start_hit_index, uint32_t ref_start, uint32_t ref_end){
 
     int thread_id = threadIdx.x;
     int block_id = blockIdx.x;
@@ -195,7 +235,12 @@ void find_hits (const uint32_t* __restrict__  d_index_table, const uint32_t* __r
                 d_hsp[dram_address].ref_start = ref_loc[warp_id];
                 d_hsp[dram_address].query_start = query_loc; 
                 d_hsp[dram_address].len = 0;
-                d_hsp[dram_address].score = 0;
+                if(ref_loc[warp_id] >= ref_start && ref_loc[warp_id] <= ref_end){
+                    d_hsp[dram_address].score = 0;
+                }
+                else{
+                    d_hsp[dram_address].score = -1;
+                }
             }
         }
     }
@@ -217,6 +262,7 @@ void find_hsps (const char* __restrict__  d_ref_seq, const char* __restrict__  d
     __shared__ int prev_score[NUM_WARPS];
     __shared__ int prev_max_score[NUM_WARPS];
     __shared__ int prev_max_pos[NUM_WARPS];
+    __shared__ bool find_hsp[NUM_WARPS]; 
     __shared__ bool edge_found[NUM_WARPS]; 
     __shared__ bool xdrop_found[NUM_WARPS]; 
     __shared__ bool new_max_found[NUM_WARPS]; 
@@ -255,6 +301,12 @@ void find_hsps (const char* __restrict__  d_ref_seq, const char* __restrict__  d
                 ref_loc[warp_id] = d_hsp[hid].ref_start;
                 query_loc[warp_id] = d_hsp[hid].query_start;
                 total_score[warp_id] = 0; 
+                if(d_hsp[hid].score < 0){
+                    find_hsp[warp_id] = false;
+                }
+                else{
+                    find_hsp[warp_id] = true;
+                }
             }
         }
         else{
@@ -272,9 +324,14 @@ void find_hsps (const char* __restrict__  d_ref_seq, const char* __restrict__  d
         //Right extension
 
         if(lane_id ==0){
+            if(find_hsp[warp_id]){
+                edge_found[warp_id] = false;
+            }
+            else{
+                edge_found[warp_id] = true;
+            }
             tile[warp_id] = 0;
             xdrop_found[warp_id] = false;
-            edge_found[warp_id] = false;
             new_max_found[warp_id] = false;
             entropy[warp_id] = 1.0f;
             prev_score[warp_id] = 0;
@@ -422,6 +479,7 @@ void find_hsps (const char* __restrict__  d_ref_seq, const char* __restrict__  d
                 }
             }
             __syncwarp();
+
         }
 
         __syncwarp();
@@ -430,9 +488,14 @@ void find_hsps (const char* __restrict__  d_ref_seq, const char* __restrict__  d
         //Left extension
 
         if(lane_id ==0){
+            if(find_hsp[warp_id]){
+                edge_found[warp_id] = false;
+            }
+            else{
+                edge_found[warp_id] = true;
+            }
             tile[warp_id] = 0;
             xdrop_found[warp_id] = false;
-            edge_found[warp_id] = false;
             new_max_found[warp_id] = false;
             prev_score[warp_id] = 0;
             prev_max_score[warp_id] = 0;
@@ -504,7 +567,7 @@ void find_hsps (const char* __restrict__  d_ref_seq, const char* __restrict__  d
                 }
             }
 
-            if(xdrop_done){
+            if(xdrop_done == 1){
                 max_thread_score = prev_max_score[warp_id];
                 max_pos = prev_max_pos[warp_id];
             }
@@ -573,6 +636,7 @@ void find_hsps (const char* __restrict__  d_ref_seq, const char* __restrict__  d
                 }
             }
             __syncwarp();
+
         }
 
         //////////////////////////////////////////////////////////////////
@@ -624,7 +688,7 @@ void find_hsps (const char* __restrict__  d_ref_seq, const char* __restrict__  d
 }
 
 __global__
-void compress_output (uint32_t* d_done, segmentPair* d_hsp, segmentPair* d_hsp_reduced, int num_hits){
+void compress_output (uint32_t* d_done, segmentPair* d_hsp, segmentPair* d_hsp_reduced, int num_hits, bool rev, uint32_t len){
 
     int thread_id = threadIdx.x;
     int block_dim = blockDim.x;
@@ -637,21 +701,26 @@ void compress_output (uint32_t* d_done, segmentPair* d_hsp, segmentPair* d_hsp_r
 
     for (uint32_t id = start; id < num_hits; id += stride) {
         index = d_done[id];
+        segmentPair output = d_hsp[id];
+
+        if(rev)
+            output.query_start = len - 1 - (output.query_start + output.len);
+
 
         if(id > 0){
             if(index > d_done[id-1]){
-                d_hsp_reduced[index-1] = d_hsp[id];
+                d_hsp_reduced[index-1] = output;
             }
         }
         else{
             if(index == 1){
-                d_hsp_reduced[0] = d_hsp[0];
+                d_hsp_reduced[0] = output;
             }
         }
     }
 }
 
-std::vector<segmentPair> SeedAndFilter (std::vector<uint64_t> seed_offset_vector, bool rev, uint32_t buffer){
+std::vector<segmentPair> SeedAndFilter (std::vector<uint64_t> seed_offset_vector, bool rev, uint32_t ref_start, uint32_t ref_end){
 
     uint32_t num_hits = 0;
     uint32_t total_anchors = 0;
@@ -709,13 +778,13 @@ std::vector<segmentPair> SeedAndFilter (std::vector<uint64_t> seed_offset_vector
             iter_num_seeds = limit_pos[i] + 1 - start_seed_index;
             iter_num_hits  = d_hit_num_vec[g][limit_pos[i]] - start_hit_val;
 
-            find_hits <<<iter_num_seeds, BLOCK_SIZE>>> (d_index_table[g], d_pos_table[g], d_seed_offsets[g], seed_size, d_hit_num_array[g], iter_num_hits, d_hsp[g], start_seed_index, start_hit_val);
+            find_hits <<<iter_num_seeds, BLOCK_SIZE>>> (d_index_table[g], d_pos_table[g], d_seed_offsets[g], seed_size, d_hit_num_array[g], iter_num_hits, d_hsp[g], start_seed_index, start_hit_val, ref_start, ref_end);
 
             if(rev){
-                find_hsps <<<1024, BLOCK_SIZE>>> (d_ref_seq[g], d_query_rc_seq[buffer*NUM_DEVICES+g], ref_len, query_length[buffer], d_sub_mat[g], noentropy, xdrop, hspthresh, iter_num_hits, d_hsp[g], d_done[g]);
+                find_hsps <<<1024, BLOCK_SIZE>>> (d_ref_seq[g], d_seq_rc[g], ref_len, ref_len, d_sub_mat[g], noentropy, xdrop, hspthresh, iter_num_hits, d_hsp[g], d_done[g]);
             }
             else{
-                find_hsps <<<1024, BLOCK_SIZE>>> (d_ref_seq[g], d_query_seq[buffer*NUM_DEVICES+g], ref_len, query_length[buffer], d_sub_mat[g], noentropy, xdrop, hspthresh, iter_num_hits, d_hsp[g], d_done[g]);
+                find_hsps <<<1024, BLOCK_SIZE>>> (d_ref_seq[g], d_ref_seq[g], ref_len, ref_len, d_sub_mat[g], noentropy, xdrop, hspthresh, iter_num_hits, d_hsp[g], d_done[g]);
             }
 
             thrust::inclusive_scan(d_done_vec[g].begin(), d_done_vec[g].begin() + iter_num_hits, d_done_vec[g].begin());
@@ -723,7 +792,7 @@ std::vector<segmentPair> SeedAndFilter (std::vector<uint64_t> seed_offset_vector
             check_cuda_memcpy((void*)&num_anchors[i], (void*)(d_done[g]+iter_num_hits-1), sizeof(uint32_t), cudaMemcpyDeviceToHost, "num_anchors");
 
             if(num_anchors[i] > 0){
-                compress_output <<<MAX_BLOCKS, MAX_THREADS>>>(d_done[g], d_hsp[g], d_hsp_reduced[g], iter_num_hits);
+                compress_output <<<MAX_BLOCKS, MAX_THREADS>>>(d_done[g], d_hsp[g], d_hsp_reduced[g], iter_num_hits, rev, ref_len);
 
                 thrust::stable_sort(d_hsp_reduced_vec[g].begin(), d_hsp_reduced_vec[g].begin()+num_anchors[i], hspComp());
                 
@@ -731,11 +800,19 @@ std::vector<segmentPair> SeedAndFilter (std::vector<uint64_t> seed_offset_vector
 
                 num_anchors[i] = thrust::distance(d_hsp_vec[g].begin(), result_end), num_anchors[i];
 
+                thrust::stable_sort(d_hsp_vec[g].begin(), d_hsp_vec[g].begin()+num_anchors[i], hspDiagComp());
+                
+                thrust::device_vector<segmentPair>::iterator result_end2 = thrust::unique_copy(d_hsp_vec[g].begin(), d_hsp_vec[g].begin()+num_anchors[i], d_hsp_reduced_vec[g].begin(),  hspDiagEqual());
+
+                num_anchors[i] = thrust::distance(d_hsp_reduced_vec[g].begin(), result_end2), num_anchors[i];
+
+                thrust::stable_sort(d_hsp_reduced_vec[g].begin(), d_hsp_reduced_vec[g].begin()+num_anchors[i], hspFinalComp());
+
                 total_anchors += num_anchors[i];
 
                 h_hsp[i] = (segmentPair*) calloc(num_anchors[i], sizeof(segmentPair));
 
-                check_cuda_memcpy((void*)h_hsp[i], (void*)d_hsp[g], num_anchors[i]*sizeof(segmentPair), cudaMemcpyDeviceToHost, "hsp_output");
+                check_cuda_memcpy((void*)h_hsp[i], (void*)d_hsp_reduced[g], num_anchors[i]*sizeof(segmentPair), cudaMemcpyDeviceToHost, "hsp_output");
             }
 
             start_seed_index = limit_pos[i] + 1;
@@ -797,8 +874,7 @@ void InitializeProcessor (bool transition, uint32_t WGA_CHUNK, uint32_t input_se
 
     d_sub_mat = (int**) malloc(NUM_DEVICES*sizeof(int*));
 
-    d_query_seq = (char**) malloc(BUFFER_DEPTH*NUM_DEVICES*sizeof(char*));
-    d_query_rc_seq = (char**) malloc(BUFFER_DEPTH*NUM_DEVICES*sizeof(char*));
+    d_seq_rc = (char**) malloc(NUM_DEVICES*sizeof(char*));
 
     d_seed_offsets = (uint64_t**) malloc(NUM_DEVICES*sizeof(uint64_t*));
 
@@ -846,36 +922,25 @@ void InitializeProcessor (bool transition, uint32_t WGA_CHUNK, uint32_t input_se
     }
 }
 
-void SendQueryWriteRequest (size_t start_addr, uint32_t len, uint32_t buffer){
-
-    query_length[buffer] = len;
+void SendQueryWriteRequest (){
 
     for(int g = 0; g < NUM_DEVICES; g++){
 
         check_cuda_setDevice(g, "SendQueryWriteRequest");
 
-        char* d_query_seq_tmp;
-        check_cuda_malloc((void**)&d_query_seq_tmp, len*sizeof(char), "tmp query_seq"); 
+        check_cuda_malloc((void**)&d_seq_rc[g], ref_len*sizeof(char), "seq_rc"); 
 
-        check_cuda_memcpy((void*)d_query_seq_tmp, (void*)(query_DRAM->buffer + start_addr), len*sizeof(char), cudaMemcpyHostToDevice, "query_seq");
-
-        check_cuda_malloc((void**)&d_query_seq[buffer*NUM_DEVICES+g], len*sizeof(char), "query_seq"); 
-        check_cuda_malloc((void**)&d_query_rc_seq[buffer*NUM_DEVICES+g], len*sizeof(char), "query_rc_seq"); 
-
-        compress_string_rev_comp <<<MAX_BLOCKS, MAX_THREADS>>> (len, d_query_seq_tmp, d_query_seq[buffer*NUM_DEVICES+g], d_query_rc_seq[buffer*NUM_DEVICES+g]);
-
-        check_cuda_free((void*)d_query_seq_tmp, "d_query_seq_tmp");
+        rev_comp_string <<<MAX_BLOCKS, MAX_THREADS>>> (ref_len, d_ref_seq[g], d_seq_rc[g]);
     }
 }
 
-void ClearQuery(uint32_t buffer){
+void ClearQuery(){
 
     for(int g = 0; g < NUM_DEVICES; g++){
 
         check_cuda_setDevice(g, "ClearQuery");
 
-        check_cuda_free((void*)d_query_seq[buffer*NUM_DEVICES+g], "d_query_seq");
-        check_cuda_free((void*)d_query_rc_seq[buffer*NUM_DEVICES+g], "d_query_rc_seq");
+        check_cuda_free((void*)d_seq_rc[g], "d_seq_rc");
     }
 }
 

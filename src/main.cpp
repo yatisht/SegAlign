@@ -10,7 +10,9 @@
 #include "kseq.h"
 #include "zlib.h"
 #include "graph.h"
-#include "parameters.h"
+#include "ntcoding.h"
+#include "seed_filter_interface.h"
+#include "seed_filter.h"
 #include "store.h"
 
 namespace po = boost::program_options;
@@ -22,7 +24,6 @@ struct timeval start_time, end_time, start_time_complete, end_time_complete;
 long useconds, seconds, mseconds;
 
 Configuration cfg;
-SeedPosTable *sa;
 
 DRAM *ref_DRAM = nullptr;
 DRAM *query_DRAM = nullptr;
@@ -54,75 +55,8 @@ std::vector<uint32_t> ref_block_len;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void RevComp(size_t rc_start, size_t start, uint32_t len) {
-
-    size_t r = rc_start;
-    for (size_t i = start+len; i> start; i--) {
-        
-        switch (query_DRAM->buffer[i-1]) {
-            case 'a': query_rc_DRAM->buffer[r++] = 't';
-                      break;
-
-            case 'A': query_rc_DRAM->buffer[r++] = 'T';
-                      break;
-
-            case 'c': query_rc_DRAM->buffer[r++] = 'g';
-                      break;
-
-            case 'C': query_rc_DRAM->buffer[r++] = 'G';
-                      break;
-
-            case 'g': query_rc_DRAM->buffer[r++] = 'c';
-                      break;
-
-            case 'G': query_rc_DRAM->buffer[r++] = 'C';
-                      break;
-
-            case 't': query_rc_DRAM->buffer[r++] = 'a';
-                      break;
-
-            case 'T': query_rc_DRAM->buffer[r++] = 'A';
-                      break;
-
-            case 'n': query_rc_DRAM->buffer[r++] = 'n';
-                      break;
-
-            case 'N': query_rc_DRAM->buffer[r++] = 'N';
-                      break;
-
-            case '&': query_rc_DRAM->buffer[r++] = '&';
-                      break;
-
-            default: printf("Bad Nt char! '%c' %lu\n", query_DRAM->buffer[i], i);
-        }
-    }
-}
 
 int main(int argc, char** argv){
-
-    po::options_description desc{"Options"};
-    desc.add_options()
-        ("strand", po::value<std::string>(&cfg.strand)->default_value("both"), "strand to search - plus/minus/both")
-        ("scoring", po::value<std::string>(&cfg.scoring_file), "Scoring file in LASTZ format")
-        ("ambiguous", po::value<std::string>(&cfg.ambiguous), "ambiguous nucleotides - n/iupac")
-        ("seed", po::value<std::string>(&cfg.seed_shape)->default_value("12of19"), "seed pattern-12of19(1110100110010101111)/14of22(1110101100110010101111)/an arbitrary pattern of 1s, 0s, and Ts ")
-        ("notransition", po::bool_switch(&cfg.transition)->default_value(false), "don't allow one transition in a seed hit")
-        ("step", po::value<uint32_t>(&cfg.step)->default_value(1), "Offset between the starting positions of successive target words considered for generating seed table")
-        ("xdrop", po::value<int>(&cfg.xdrop)->default_value(910), "x-drop value for gap-free extension")
-        ("hspthresh", po::value<int>(&cfg.hspthresh)->default_value(3000), "segment score threshold for high scoring pairs")
-        ("noentropy", po::bool_switch(&cfg.noentropy)->default_value(false), "don't adjust low score segment pair scores using entropy factor after filtering stage")
-        ("nogapped", po::bool_switch(&cfg.gapped)->default_value(false), "don't perform gapped extension stage")
-        ("ydrop", po::value<int>(&cfg.ydrop)->default_value(9430), "y-drop value for gapped extension")
-        ("gappedthresh", po::value<int>(&cfg.gappedthresh), "score threshold for gapped alignments")
-        ("notrivial", po::bool_switch(&cfg.notrivial)->default_value(false), "Don't output a trivial self-alignment block if the target and query sequences are identical")
-        ("format", po::value<std::string>(&cfg.output_format)->default_value("maf-"), "format of output file (same formats as provided by LASTZ) - lav, lav+text, axt, axt+, maf, maf+, maf-, sam, softsam, sam-, softsam-, cigar, BLASTN, differences, rdotplot, text")
-        ("output", po::value<std::string>(&cfg.output), "output filename")
-        ("markend", po::bool_switch(&cfg.markend), "write a marker line just before completion")
-        ("wga_chunk", po::value<uint32_t>(&cfg.wga_chunk_size)->default_value(DEFAULT_WGA_CHUNK), "chunk sizes for GPU calls for Xdrop - change only if you are a developer")
-        ("lastz_interval", po::value<uint32_t>(&cfg.lastz_interval_size)->default_value(DEFAULT_LASTZ_INTERVAL), "LASTZ interval for ydrop - change only if you are a developer")
-        ("num_gpu", po::value<int>(&cfg.num_gpu)->default_value(-1), "Specify number of GPUs to use - -1 if all the GPUs should be used")
-        ("debug", po::bool_switch(&cfg.debug)->default_value(false), "print debug messages")
-        ("help", "Print help messages");
 
     po::options_description hidden;
     hidden.add_options()
@@ -130,8 +64,57 @@ int main(int argc, char** argv){
         ("query", po::value<std::string>(&cfg.query_filename)->required(), "query sequence file in FASTA format")
         ("data_folder", po::value<std::string>(&cfg.data_folder)->required(), "folder with sequence files in 2bit format");
 
+    po::options_description desc{"Sequence Options"};
+    desc.add_options()
+        ("strand", po::value<std::string>(&cfg.strand)->default_value("both"), "strand to search - plus/minus/both");
+
+    po::options_description scoring_desc{"Scoring Options"};
+    scoring_desc.add_options()
+        ("scoring", po::value<std::string>(&cfg.scoring_file), "Scoring file in LASTZ format")
+        ("ambiguous", po::value<std::string>(&cfg.ambiguous), "ambiguous nucleotides - n/iupac");
+
+    po::options_description seeding_desc{"Seeding Options"};
+    seeding_desc.add_options()
+        ("seed", po::value<std::string>(&cfg.seed_shape)->default_value("12of19"), "seed pattern-12of19(1110100110010101111)/14of22(1110101100110010101111)/an arbitrary pattern of 1s, 0s, and Ts ")
+        ("step", po::value<uint32_t>(&cfg.step)->default_value(1), "Offset between the starting positions of successive target words considered for generating seed table")
+        ("notransition", po::bool_switch(&cfg.seed.transition)->default_value(false), "don't allow one transition in a seed hit");
+
+    po::options_description ungapped_desc{"Ungapped Extension Options"};
+    ungapped_desc.add_options()
+        ("xdrop", po::value<int>(&cfg.xdrop)->default_value(910), "x-drop value for gap-free extension")
+        ("hspthresh", po::value<int>(&cfg.hspthresh)->default_value(3000), "segment score threshold for high scoring pairs")
+        ("noentropy", po::bool_switch(&cfg.noentropy)->default_value(false), "don't adjust low score segment pair scores using entropy factor after filtering stage");
+
+    po::options_description gapped_desc{"Gapped Extension Options"};
+    gapped_desc.add_options()
+        ("nogapped", po::bool_switch(&cfg.gapped)->default_value(false), "don't perform gapped extension stage")
+        ("ydrop", po::value<int>(&cfg.ydrop)->default_value(9430), "y-drop value for gapped extension")
+        ("gappedthresh", po::value<int>(&cfg.gappedthresh), "score threshold for gapped alignments")
+        ("notrivial", po::bool_switch(&cfg.notrivial)->default_value(false), "Don't output a trivial self-alignment block if the target and query sequences are identical");
+
+    po::options_description output_desc{"Output Options"};
+    output_desc.add_options()
+        ("format", po::value<std::string>(&cfg.output_format)->default_value("maf-"), "format of output file (same formats as provided by LASTZ) - lav, lav+text, axt, axt+, maf, maf+, maf-, sam, softsam, sam-, softsam-, cigar, BLASTN, differences, rdotplot, text")
+        ("output", po::value<std::string>(&cfg.output), "output filename")
+        ("markend", po::bool_switch(&cfg.markend), "write a marker line just before completion");
+
+    po::options_description system_desc{"System Options"};
+    system_desc.add_options()
+        ("wga_chunk_size", po::value<uint32_t>(&cfg.wga_chunk_size)->default_value(DEFAULT_WGA_CHUNK), "chunk sizes for GPU calls for Xdrop - change only if you are a developer")
+        ("lastz_interval_size", po::value<uint32_t>(&cfg.lastz_interval_size)->default_value(DEFAULT_LASTZ_INTERVAL), "LASTZ interval for ydrop - change only if you are a developer")
+        ("seq_block_size", po::value<uint32_t>(&cfg.seq_block_size)->default_value(DEFAULT_SEQ_BLOCK_SIZE), "LASTZ interval for ydrop - change only if you are a developer")
+        ("num_gpu", po::value<int>(&cfg.num_gpu)->default_value(-1), "Specify number of GPUs to use - -1 if all the GPUs should be used")
+        ("debug", po::bool_switch(&cfg.debug)->default_value(false), "print debug messages")
+        ("help", "Print help messages");
+
     po::options_description all_options;
     all_options.add(desc);
+    all_options.add(scoring_desc);
+    all_options.add(seeding_desc);
+    all_options.add(ungapped_desc);
+    all_options.add(gapped_desc);
+    all_options.add(output_desc);
+    all_options.add(system_desc);
     all_options.add(hidden);
 
     po::positional_options_description p;
@@ -150,36 +133,49 @@ int main(int argc, char** argv){
                 fprintf(stderr, "You must specify a target file and a query file\n"); 
             }
         }
-
-        fprintf(stderr, "Usage: run_segalign target query [options]\n"); 
-        std::cout << desc << std::endl;
-        return 1;
+	
+        fprintf(stderr, "Usage: run_segalign target query [options]\n\n"); 
+        std::cerr << desc << std::endl;
+        std::cerr << scoring_desc << std::endl;
+        std::cerr << seeding_desc << std::endl;
+        std::cerr << ungapped_desc << std::endl;
+        std::cerr << gapped_desc << std::endl;
+        std::cerr << output_desc << std::endl;
+        std::cerr << system_desc << std::endl;
+	    
+        if(vm.count("help"))
+            return 0;
+        else
+            return 1;
     }
 
-    cfg.transition = !cfg.transition;
-    cfg.gapped = !cfg.gapped;
+    cfg.seed.transition = !cfg.seed.transition;
     if(cfg.seed_shape == "12of19"){
-        cfg.seed = "TTT0T00TT00T0T0TTTT"; 
-        cfg.seed_size = 19;
+        cfg.seed.shape = "TTT0T00TT00T0T0TTTT"; 
+        cfg.seed.size = 19;
     }
     else if(cfg.seed_shape == "14of22"){
-        cfg.seed = "TTT0T0TT00TT00T0T0TTTT";
-        cfg.seed_size = 22;
+        cfg.seed.shape = "TTT0T0TT00TT00T0T0TTTT";
+        cfg.seed.size = 22;
     }
     else{
         int seed_len = cfg.seed_shape.size();
-        cfg.seed = cfg.seed_shape;
+        cfg.seed.shape = cfg.seed_shape;
         for(int i = 0; i< seed_len; i++){
             if(cfg.seed_shape[i] == '1')
-                cfg.seed[i] = 'T';
+                cfg.seed.shape[i] = 'T';
             else
-                cfg.seed[i] = '0';
+                cfg.seed.shape[i] = '0';
         }
-        cfg.seed_size = cfg.seed.size();
+        cfg.seed.size = seed_len;
     }
+
+    cfg.seed.kmer_size = GenerateShapePos(cfg.seed.shape);
 
     if(vm.count("gappedthresh") == 0)
         cfg.gappedthresh = cfg.hspthresh; 
+
+    cfg.gapped = !cfg.gapped;
 
     int ambiguous_reward = -100;
     int ambiguous_penalty = -100;
@@ -271,15 +267,15 @@ int main(int argc, char** argv){
     if(cfg.debug){
         fprintf(stderr, "Target %s\n", cfg.reference_filename.c_str());
         fprintf(stderr, "Query %s\n", cfg.query_filename.c_str());
-        fprintf(stderr, "Seed %s\n", cfg.seed.c_str());
-        fprintf(stderr, "Seed size %d\n", cfg.seed_size);
-        fprintf(stderr, "Transition %d\n", cfg.transition);
-        fprintf(stderr, "Gapped %d\n",cfg.gapped);
-        fprintf(stderr, "xdrop %d\n", cfg.xdrop);
-        fprintf(stderr, "ydrop %d\n", cfg.ydrop);
-        fprintf(stderr, "HSP threshold %d\n", cfg.hspthresh);
-        fprintf(stderr, "gapped threshold %d\n", cfg.gappedthresh);
         fprintf(stderr, "ambiguous %s\n", cfg.ambiguous.c_str());
+        fprintf(stderr, "Seed %s\n", cfg.seed.shape.c_str());
+        fprintf(stderr, "Seed size %d\n", cfg.seed.size);
+        fprintf(stderr, "Transition %d\n", cfg.seed.transition);
+        fprintf(stderr, "xdrop %d\n", cfg.xdrop);
+        fprintf(stderr, "HSP threshold %d\n", cfg.hspthresh);
+        fprintf(stderr, "Gapped %d\n",cfg.gapped);
+        fprintf(stderr, "ydrop %d\n", cfg.ydrop);
+        fprintf(stderr, "gapped threshold %d\n", cfg.gappedthresh);
 
         for(int i = 0; i < NUC; i++){
             for(int j = 0; j < NUC; j++){
@@ -291,7 +287,8 @@ int main(int argc, char** argv){
 
     fprintf(stderr, "Using %d threads\n", cfg.num_threads);
 
-    cfg.num_gpu = g_InitializeProcessor (cfg.num_gpu, cfg.transition, cfg.wga_chunk_size, cfg.seed_size, cfg.sub_mat, cfg.xdrop, cfg.hspthresh, cfg.noentropy);
+    cfg.num_gpu = g_InitializeInterface (cfg.num_gpu);
+    g_InitializeProcessor (cfg.seed.transition, cfg.wga_chunk_size, cfg.seed.size, cfg.sub_mat, cfg.xdrop, cfg.hspthresh, cfg.noentropy);
 
     ref_DRAM = new DRAM;
     query_DRAM = new DRAM;
@@ -352,7 +349,7 @@ int main(int argc, char** argv){
         seq_block_len += seq_len;
         total_q_chr++;
 
-        if(seq_block_len > SEQ_BLOCK_SIZE){
+        if(seq_block_len > DEFAULT_SEQ_BLOCK_SIZE){
 
             query_block_len.push_back(seq_block_len);
             if(seq_block_len > query_max_block_len)
@@ -370,11 +367,11 @@ int main(int argc, char** argv){
                 exit(9); 
             }
 
-            RevComp(query_rc_DRAM->bufferPosition, seq_block_start, seq_block_len);
+            RevComp(query_rc_DRAM->buffer, query_DRAM->buffer, query_rc_DRAM->bufferPosition, seq_block_start, seq_block_len);
             query_rc_DRAM->bufferPosition += seq_block_len;
 
             uint32_t curr_pos = 0;
-            uint32_t end_pos = seq_block_len - cfg.seed_size;
+            uint32_t end_pos = seq_block_len - cfg.seed.size;
 
             while (curr_pos < end_pos) {
                 uint32_t start = curr_pos;
@@ -419,7 +416,7 @@ int main(int argc, char** argv){
             exit(9); 
         }
 
-        RevComp(seq_block_start, query_rc_DRAM->bufferPosition, seq_block_len);
+        RevComp(query_rc_DRAM->buffer, query_DRAM->buffer, seq_block_start, query_rc_DRAM->bufferPosition, seq_block_len);
         query_rc_DRAM->bufferPosition += seq_block_len;
 
         for(int i = block_chrs.size()-1; i >= 0; i--){
@@ -432,7 +429,7 @@ int main(int argc, char** argv){
         total_q_blocks += 1;
 
         uint32_t curr_pos = 0;
-        uint32_t end_pos = seq_block_len - cfg.seed_size;
+        uint32_t end_pos = seq_block_len - cfg.seed.size;
         
         while (curr_pos < end_pos) {
             uint32_t start = curr_pos;
@@ -508,7 +505,7 @@ int main(int argc, char** argv){
         seq_block_len += seq_len;
         total_r_chr++;
 
-        if(seq_block_len > SEQ_BLOCK_SIZE){
+        if(seq_block_len > DEFAULT_SEQ_BLOCK_SIZE){
 
             ref_block_len.push_back(seq_block_len);
 
@@ -544,9 +541,6 @@ int main(int argc, char** argv){
     	fprintf(stderr, "Time elapsed (loading complete target from file): %ld msec \n\n", mseconds);
     }
 
-    cfg.num_ref = total_r_chr;
-    cfg.num_query = total_q_chr;
-
     // start alignment
     fprintf(stderr, "\nStart alignment ...\n");
     tbb::flow::graph align_graph;
@@ -571,51 +565,54 @@ int main(int argc, char** argv){
 
     tbb::flow::make_edge(ticketer, tbb::flow::input_port<1>(gatekeeper));
 
-    uint32_t r_chr_sent = 0;
-    uint32_t send_r_len;
-    size_t send_r_start;
-    bool send_ref_chr = true;
+    bool send_r_block = true;
+    uint32_t r_blocks_sent = 0;
 
-    uint32_t q_chr_sent;
-    uint32_t send_q_len;
-    size_t send_q_start;
-    bool send_query_chr = false;
-    bool invoke_q_chr = false; 
-    uint32_t send_buffer_id;
+    uint32_t send_r_block_len;
+    size_t send_r_block_start;
 
-    uint32_t prev_chr_intervals[BUFFER_DEPTH];  
+    bool send_q_block = false;
+    uint32_t q_blocks_sent = 0;
+
+    uint32_t send_q_block_len;
+    size_t send_q_block_start;
+    uint32_t send_q_buffer_id;
+
+    bool invoke_q_block = false; 
+    uint32_t q_blocks_invoked = 0;;
+
+    uint32_t invoke_q_len;
+    size_t invoke_q_start;
+    uint32_t invoke_q_buffer_id;
+
     uint32_t completed_intervals;  
-    uint32_t chr_intervals_invoked;
-    uint32_t chr_intervals_num;
-
-    uint32_t q_len;
-    size_t q_start;
-    size_t rc_q_start;
-    uint32_t q_buffer_id;
-    uint32_t q_chr_invoked;
-    uint32_t q_num;
-    uint32_t r_num;
+    uint32_t prev_block_intervals[BUFFER_DEPTH];  
+    uint32_t block_intervals_invoked;
+    uint32_t block_intervals_num;
 
     gettimeofday(&start_time, NULL);
     tbb::flow::source_node<seeder_payload> reader(align_graph,
         [&](seeder_payload &op) -> bool {
 
         while(true){
-            if (send_ref_chr) {
+            if (send_r_block) {
 
-                send_r_start = ref_block_start[r_chr_sent];
-                send_r_len   = ref_block_len[r_chr_sent];
+                send_r_block_start = ref_block_start[r_blocks_sent];
+                send_r_block_len   = ref_block_len[r_blocks_sent];
 
-                fprintf(stderr, "\nSending reference block %u ...\n", r_chr_sent);
-                if(r_chr_sent > 0)
-                    g_clearRef();
-                g_SendRefWriteRequest (send_r_start, send_r_len);
+                fprintf(stderr, "\nSending reference block %u ...\n", r_blocks_sent);
+
+                if(r_blocks_sent > 0)
+                    g_ClearRef();
+
+                g_SendRefWriteRequest (ref_DRAM->buffer, send_r_block_start, send_r_block_len);
 
                 if(cfg.debug){
                     gettimeofday(&start_time_complete, NULL);
                 }
 
-                sa = new SeedPosTable (ref_DRAM->buffer, send_r_start, send_r_len, cfg.seed, cfg.step);
+                GenerateSeedPosTable (ref_DRAM->buffer, send_r_block_start, send_r_block_len, cfg.step, cfg.seed.size, cfg.seed.kmer_size);
+
                 if(cfg.debug){
                     gettimeofday(&end_time_complete, NULL);
                     useconds = end_time_complete.tv_usec - start_time_complete.tv_usec;
@@ -626,100 +623,106 @@ int main(int argc, char** argv){
 
                 for(int i = 0; i < BUFFER_DEPTH; i++){
                     seeder_body::num_seeded_regions[i] = 0;
-                    prev_chr_intervals[i] = 0;
+                    prev_block_intervals[i] = 0;
                 }
                 seeder_body::total_xdrop = 0;
 
-                q_chr_invoked = 0;
-                chr_intervals_invoked = 0;
-                chr_intervals_num = 0;
+                send_q_block = false;
+                q_blocks_sent = 0;
+
+                invoke_q_block = true; 
+                q_blocks_invoked = 0;
+
+                invoke_q_buffer_id = 0;
+
                 completed_intervals = 0;  
-                q_buffer_id = 0;
+                block_intervals_invoked = 0;
+                block_intervals_num = 0;
 
-                q_chr_sent = 0;
-                send_query_chr = false;
-                invoke_q_chr = true; 
+                while(q_blocks_sent < BUFFER_DEPTH && q_blocks_sent < total_q_blocks){
 
-                while(q_chr_sent < BUFFER_DEPTH && q_chr_sent < total_q_blocks){
+                    send_q_block_start = query_block_start[q_blocks_sent];
+                    send_q_block_len = query_block_len[q_blocks_sent];
+                    q_buffer[q_blocks_sent] = q_blocks_sent;
+                    send_q_buffer_id = q_blocks_sent;
 
-                    send_q_start = query_block_start[q_chr_sent];
-                    send_q_len = query_block_len[q_chr_sent];
+                    fprintf(stderr, "\nSending query block %u with buffer %d ...\n", q_blocks_sent, send_q_buffer_id);
 
-                    q_buffer[q_chr_sent] = q_chr_sent;
-                    send_buffer_id = q_chr_sent;
-                    fprintf(stderr, "\nSending query block %u with buffer %d ...\n", q_chr_sent, send_buffer_id);
-                    if(r_chr_sent > 0)
-                        g_clearQuery(send_buffer_id);
-                    g_SendQueryWriteRequest (send_q_start, send_q_len, send_buffer_id);
-                    prev_chr_intervals[q_chr_sent] = block_num_intervals[q_chr_sent];
-                    q_chr_sent++;
+                    if(r_blocks_sent > 0)
+                        g_ClearQuery(send_q_buffer_id);
+
+                    g_SendQueryWriteRequest (send_q_block_start, send_q_block_len, send_q_buffer_id);
+                    prev_block_intervals[q_blocks_sent] = block_num_intervals[q_blocks_sent];
+                    q_blocks_sent++;
                 }
 
-                r_chr_sent++;
-                send_ref_chr = false;
+                r_blocks_sent++;
+                send_r_block = false;
             }
             else{
-                if(q_chr_invoked > 0){
+                if(q_blocks_invoked > 0){
                     for(int i = 0; i < BUFFER_DEPTH; i++){
-                        if(q_chr_sent < total_q_blocks && seeder_body::num_seeded_regions[i] == prev_chr_intervals[i]){
-                            send_q_start = query_block_start[q_chr_sent];
-                            send_q_len = query_block_len[q_chr_sent];
+                        if(q_blocks_sent < total_q_blocks && seeder_body::num_seeded_regions[i] == prev_block_intervals[i]){
+                            send_q_block_start = query_block_start[q_blocks_sent];
+                            send_q_block_len = query_block_len[q_blocks_sent];
+                            q_buffer[q_blocks_sent] = i;
 
-                            q_buffer[q_chr_sent] = i;
-                            prev_chr_intervals[i] += block_num_intervals[q_chr_sent];
+                            prev_block_intervals[i] += block_num_intervals[q_blocks_sent];
 
-                            fprintf(stderr, "\nSending query block %u with buffer %d ...\n", q_chr_sent, i);
-                            g_clearQuery(i);
-                            g_SendQueryWriteRequest (send_q_start, send_q_len, i);
+                            fprintf(stderr, "\nSending query block %u with buffer %d ...\n", q_blocks_sent, i);
+                            g_ClearQuery(i);
+                            g_SendQueryWriteRequest (send_q_block_start, send_q_block_len, i);
 
-                            q_chr_sent++;
+                            q_blocks_sent++;
                         }
                     }
 
-                    if(r_chr_sent < total_r_blocks && total_query_intervals == seeder_body::total_xdrop.load()){
-                        send_ref_chr = true; 
+                    if(r_blocks_sent < total_r_blocks && total_query_intervals == seeder_body::total_xdrop.load()){
+                        send_r_block = true; 
                     }
                 }
             }
 
-            if(q_chr_invoked < q_chr_sent && invoke_q_chr) {
+            if(q_blocks_invoked < q_blocks_sent && invoke_q_block) {
 
-                q_start = query_block_start[q_chr_invoked];
-                q_len   = query_block_len[q_chr_invoked];
+                invoke_q_start = query_block_start[q_blocks_invoked];
+                invoke_q_len   = query_block_len[q_blocks_invoked];
+                invoke_q_buffer_id = q_buffer[q_blocks_invoked];
 
-                q_buffer_id = q_buffer[q_chr_invoked];
-                completed_intervals += chr_intervals_num;
-                chr_intervals_num = block_num_intervals[q_chr_invoked];
+                completed_intervals += block_intervals_num;
+                block_intervals_num = block_num_intervals[q_blocks_invoked];
 
-
-                chr_intervals_invoked = 0;
-                invoke_q_chr = false;
+                block_intervals_invoked = 0;
+                invoke_q_block = false;
             }
 
-            if(q_chr_invoked < total_q_blocks) {
-                if (chr_intervals_invoked < chr_intervals_num) {
-                    seed_interval& inter = get<1>(op);
-                    seed_interval curr_inter = interval_list[completed_intervals + chr_intervals_invoked++];
-                    inter.start = curr_inter.start;
-                    inter.end = curr_inter.end;
-                    inter.num_invoked = chr_intervals_invoked;
-                    inter.num_intervals = chr_intervals_num;
-                    inter.buffer = q_buffer_id;
-                    reader_output& chrom = get<0>(op);
-                    chrom.q_start = q_start;
-                    chrom.r_start = send_r_start;
-                    chrom.r_len = send_r_len;
-                    chrom.q_len = q_len-cfg.seed_size;
-                    chrom.block_index = q_chr_invoked; 
-                    chrom.r_block_index = r_chr_sent; 
-                    if(chr_intervals_invoked == chr_intervals_num) {
-                        q_chr_invoked++;
-                        invoke_q_chr = true;
+            if(q_blocks_invoked < total_q_blocks) {
+                if (block_intervals_invoked < block_intervals_num) {
+                    seq_block& curr_block = get<0>(op);
+                    curr_block.r_index  = r_blocks_sent; 
+                    curr_block.q_index  = q_blocks_invoked; 
+                    curr_block.r_start  = send_r_block_start;
+                    curr_block.q_start  = invoke_q_start;
+                    curr_block.r_len    = send_r_block_len;
+                    curr_block.q_len    = invoke_q_len-cfg.seed.size;
+
+                    seed_interval& curr_inter = get<1>(op);
+                    seed_interval inter = interval_list[completed_intervals + block_intervals_invoked++];
+                    curr_inter.start = inter.start;
+                    curr_inter.end   = inter.end;
+                    curr_inter.num_invoked   = block_intervals_invoked;
+                    curr_inter.num_intervals = block_intervals_num;
+                    curr_inter.buffer        = invoke_q_buffer_id;
+
+                    if(block_intervals_invoked == block_intervals_num) {
+                        q_blocks_invoked++;
+                        invoke_q_block = true;
                     }
+
                     return true;
                 }
             }
-            else if(r_chr_sent == total_r_blocks){
+            else if(r_blocks_sent == total_r_blocks){
                 return false;
             }
             }

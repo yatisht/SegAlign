@@ -1,6 +1,13 @@
-# SegAlign 
+[license-badge]: https://img.shields.io/badge/License-MIT-yellow.svg 
+[license-link]: https://opensource.org/licenses/MIT
 
-A Scalable GPU System for Pairwise Whole Genome Alignments
+[![License][license-badge]][license-link]
+[![Build Status](https://travis-ci.com/gsneha26/SegAlign.svg?branch=master)](https://travis-ci.com/gsneha26/SegAlign)
+[![Published in SC20](https://img.shields.io/badge/published%20in-SC20-blue.svg)](https://doi.ieeecomputersociety.org/10.1109/SC41405.2020.00043)
+
+<img src="logo.png" width="300">
+
+A Scalable GPU System for Pairwise Whole Genome Alignments based on LASTZ's seed-filter-extend paradigm.
 
 ## Table of Contents
 
@@ -8,6 +15,9 @@ A Scalable GPU System for Pairwise Whole Genome Alignments
 - [Dependencies](#dependencies)
 - [How to run SegAlign](#run)
     - [Running a test](#test)
+- [How to run SegAlign repeat masker](#run_rm)
+    - [Running a test](#test_rm)
+- [Citing SegAlign](#cite_segalign)
 
 ## <a name="overview"></a> Overview
 
@@ -61,5 +71,33 @@ The dependencies can be installed with the given script as follows, which might 
     $ wget https://hgdownload-test.gi.ucsc.edu/goldenPath/cb4/bigZips/cb4.2bit 
     $ twoBitToFa ce11.2bit ce11.fa
     $ twoBitToFa cb4.2bit cb4.fa
-    $ run_segalign ce11.fa cb4.fa > ce11.cb4.maf
+    $ run_segalign ce11.fa cb4.fa --output=ce11.cb4.maf
 ```
+
+## <a name="run_rm"></a> How to run SegAlign repeat masker
+* Run SegAlign repeat masker
+
+```
+    $ run_segalign_repeat_masker sequence [options]
+```
+
+* For a list of options 
+
+```
+    $ run_segalign_repeat_masker --help
+```
+
+### <a name="test_rm"></a> Running a test
+
+```
+    $ cd $PROJECT_DIR
+    $ mkdir test_rm
+    $ cd test_rm
+    $ wget https://hgdownload.soe.ucsc.edu/goldenPath/ce11/bigZips/ce11.2bit
+    $ twoBitToFa ce11.2bit ce11.fa
+    $ run_segalign_repeat_masker ce11.fa --output=ce11.seg
+```
+
+## <a name="cite_segalign"></a> Citing SegAlign
+
+S. Goenka, Y. Turakhia, B. Paten and M. Horowitz,  "SegAlign: A Scalable GPU-Based Whole Genome Aligner," in 2020 SC20: International Conference for High Performance Computing, Networking, Storage and Analysis (SC), Atlanta, GA, US, 2020 pp. 540-552. doi: 10.1109/SC41405.2020.00043

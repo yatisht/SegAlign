@@ -7,11 +7,9 @@
 #include <vector>
 #include "parameters.h"
 
-#define DEFAULT_SEQ_BLOCK_SIZE 500000000
+#define DEFAULT_SEQ_BLOCK_SIZE 1000000000
 #define DEFAULT_LASTZ_INTERVAL 10000000
 #define DEFAULT_WGA_CHUNK 250000
-
-#define BUFFER_DEPTH 2
 
 using namespace tbb::flow;
 
@@ -29,14 +27,20 @@ struct segmentPair {
     int score;
 };
 
+struct Segment {
+    uint32_t query_start;
+    uint32_t len;
+};
+
 struct Configuration {
     //Input files/folder name
-    std::string reference_filename;
-    std::string query_filename;
-    std::string data_folder;
+    std::string seq_filename;
 
     // Sequence parameters
     std::string strand;
+    size_t seq_len;
+    float prop_neigh_interval;
+    uint32_t num_neigh_interval;
 
     // Scoring
     std::string scoring_file;
@@ -53,15 +57,8 @@ struct Configuration {
     int hspthresh;
     bool noentropy;
 
-    // Extension parameters
-    bool gapped;
-    int ydrop;
-    int gappedthresh;
-    bool notrivial;
-
     // Output parameters
-    std::string output_format;
-    std::string output;
+    uint32_t M;
     bool markend;
 
     // System parameters
@@ -76,25 +73,24 @@ struct Configuration {
 extern Configuration cfg;
 
 struct seq_block {
-  int r_index;
-  int q_index;
-  size_t r_start;
-  size_t q_start;
-  uint32_t r_len;
-  uint32_t q_len;
+  int index;
+  size_t start;
+  uint32_t len;
 };
 
 struct seed_interval {
     uint32_t start;
     uint32_t end;
+    uint32_t ref_start;
+    uint32_t ref_end;
     uint32_t num_invoked;
     uint32_t num_intervals;
-    uint32_t buffer;
 };
 
 typedef std::vector<segmentPair> hsp_output; 
+typedef std::vector<Segment> interval_output; 
 typedef tbb::flow::tuple <seq_block, seed_interval> seeder_payload;
-typedef tbb::flow::tuple <seeder_payload, hsp_output, hsp_output> printer_payload;
+typedef tbb::flow::tuple <seq_block, int, interval_output> printer_payload;
 typedef tbb::flow::tuple <seeder_payload, size_t> seeder_input;
 typedef tbb::flow::tuple <printer_payload, size_t> printer_input;
 typedef tbb::flow::multifunction_node<printer_input, tbb::flow::tuple<size_t>> printer_node;
@@ -104,11 +100,11 @@ struct seeder_body{
 	static std::atomic<uint64_t> num_seeds;
 	static std::atomic<uint64_t> num_hsps;
     static std::atomic<uint32_t> total_xdrop;
-    static std::atomic<uint32_t> num_seeded_regions[BUFFER_DEPTH];
+    static std::atomic<uint32_t> num_seeded_regions;
 	printer_input operator()(seeder_input input);
 };
 
-struct segment_printer_body{
+struct interval_printer_body{
 	void operator()(printer_input input, printer_node::output_ports_type & op);
 };
 

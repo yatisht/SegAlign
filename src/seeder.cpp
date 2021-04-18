@@ -1,4 +1,6 @@
 #include "graph.h"
+#include "ntcoding.h"
+#include "seed_filter.h"
 #include "store.h"
 
 std::atomic<uint64_t> seeder_body::num_seed_hits(0);
@@ -9,43 +11,44 @@ std::atomic<uint32_t> seeder_body::num_seeded_regions[BUFFER_DEPTH]={};
 
 printer_input seeder_body::operator()(seeder_input input) {
 
-    seeder_payload &payload = get<0>(input);
+    auto &payload = get<0>(input);
+    size_t token  = get<1>(input);
 
-    auto &chrom = get<0>(payload);
-    
-    auto &data = get<1>(payload);
+    auto &block_data    = get<0>(payload);
+    auto &interval_data = get<1>(payload);
 
-    size_t token = get<1>(input);
+    int r_block_index    = block_data.r_index;
+    int q_block_index    = block_data.q_index;
+    size_t r_block_start = block_data.r_start;
+    size_t q_block_start = block_data.q_start;
+    uint32_t r_block_len = block_data.r_len;
+    uint32_t q_block_len = block_data.q_len;
 
-    std::vector<segment> fw_segments;
-    std::vector<segment> rc_segments;
-    fw_segments.clear();
-    rc_segments.clear();
+    uint32_t q_inter_start = interval_data.start;
+    uint32_t q_inter_end   = interval_data.end;
+    uint32_t buffer        = interval_data.buffer;
+    uint32_t num_invoked   = interval_data.num_invoked;
+    uint32_t num_intervals = interval_data.num_intervals;
 
-    uint64_t index = 0;
-    uint64_t transition_index = 0;
+    uint32_t rc_q_inter_start = q_block_len - q_inter_end;
+    uint32_t rc_q_inter_end   = q_block_len - q_inter_start;
+
+    uint64_t kmer_index;
+    uint64_t transition_index;
     uint64_t seed_offset;
-    uint32_t start_pos = data.start;
-    uint32_t end_pos = data.end;
-    uint32_t num_invoked = data.num_invoked;
-    uint32_t num_intervals = data.num_intervals;
-    uint32_t buffer = data.buffer;
-    uint32_t q_len = chrom.q_len;
-    size_t q_start = chrom.q_start;
-    size_t r_start = chrom.r_start;
-    uint32_t r_len = chrom.r_len;
-    uint32_t q_block_index = chrom.block_index;
-    uint32_t r_block_index = chrom.r_block_index;
-    uint32_t rc_start_pos = q_len - end_pos;
-    uint32_t rc_end_pos = q_len - start_pos;
 
-    fprintf (stderr, "Chromosome block %u interval %u/%u (%u:%u) with buffer %u\n", q_block_index, num_invoked, num_intervals, start_pos, end_pos, buffer);
+    std::vector<segmentPair> fw_hsps;
+    std::vector<segmentPair> rc_hsps;
+    fw_hsps.clear();
+    rc_hsps.clear();
+
+    fprintf (stderr, "Query block %u, interval %u/%u (%u:%u) with buffer %u\n", q_block_index, num_invoked, num_intervals, q_inter_start, q_inter_end, buffer);
 
     if(cfg.strand == "plus" || cfg.strand == "both"){
-        for (uint32_t i = start_pos; i < end_pos; i += cfg.wga_chunk_size) {
+        for (uint32_t i = q_inter_start; i < q_inter_end; i += cfg.wga_chunk_size) {
 
             //end position
-            uint32_t e = std::min(i + cfg.wga_chunk_size, end_pos);
+            uint32_t e = std::min(i + cfg.wga_chunk_size, q_inter_end);
 
             std::vector<uint64_t> seed_offset_vector;
             seed_offset_vector.clear();
@@ -53,15 +56,15 @@ printer_input seeder_body::operator()(seeder_input input) {
             //start to end position in the chunk
             for (uint32_t j = i; j < e; j++) {
 
-                index = GetKmerIndexAtPos(query_DRAM->buffer, q_start+j, cfg.seed_size);
-                if (index != ((uint32_t) 1 << 31)) {
-                    seed_offset = (index << 32) + j;
+                kmer_index = GetKmerIndexAtPos(query_DRAM->buffer, q_block_start+j, cfg.seed.size);
+                if (kmer_index != ((uint32_t) 1 << 31)) {
+                    seed_offset = (kmer_index << 32) + j;
                     seed_offset_vector.push_back(seed_offset); 
 
-                    if (cfg.transition) {
-                        for (int t=0; t < sa->GetKmerSize(); t++) {
+                    if (cfg.seed.transition) {
+                        for (int t=0; t < cfg.seed.kmer_size; t++) {
                             if (IsTransitionAtPos(t) == 1) {
-                                transition_index = (index ^ (TRANSITION_MASK << (2*t)));
+                                transition_index = (kmer_index ^ (TRANSITION_MASK << (2*t)));
                                 seed_offset = (transition_index << 32) + j;
                                 seed_offset_vector.push_back(seed_offset); 
                             }
@@ -72,10 +75,10 @@ printer_input seeder_body::operator()(seeder_input input) {
 
             if(seed_offset_vector.size() > 0){
                 seeder_body::num_seeds += seed_offset_vector.size();
-                std::vector<segment> anchors = g_SeedAndFilter(seed_offset_vector, false, buffer);
+                std::vector<segmentPair> anchors = g_SeedAndFilter(seed_offset_vector, false, buffer);
                 seeder_body::num_seed_hits += anchors[0].score;
                 if(anchors.size() > 1){
-                    fw_segments.insert(fw_segments.end(), anchors.begin()+1, anchors.end());
+                    fw_hsps.insert(fw_hsps.end(), anchors.begin()+1, anchors.end());
                     seeder_body::num_hsps += anchors.size()-1;
                 }
             }
@@ -83,20 +86,20 @@ printer_input seeder_body::operator()(seeder_input input) {
     }
 
     if(cfg.strand == "minus" || cfg.strand == "both"){
-        for (uint32_t i = q_len - end_pos; i < q_len - start_pos; i += cfg.wga_chunk_size) {
-            uint32_t e = std::min(i + cfg.wga_chunk_size, q_len - start_pos);
+        for (uint32_t i = rc_q_inter_start; i < rc_q_inter_end; i += cfg.wga_chunk_size) {
+            uint32_t e = std::min(i + cfg.wga_chunk_size, rc_q_inter_end);
 
             std::vector<uint64_t> seed_offset_vector;
             seed_offset_vector.clear();
             for (uint32_t j = i; j < e; j++) {
-                index = GetKmerIndexAtPos(query_rc_DRAM->buffer, q_start+j, cfg.seed_size);
-                if (index != ((uint32_t) 1 << 31)) {
-                    seed_offset = (index << 32) + j;
+                kmer_index = GetKmerIndexAtPos(query_rc_DRAM->buffer, q_block_start+j, cfg.seed.size);
+                if (kmer_index != ((uint32_t) 1 << 31)) {
+                    seed_offset = (kmer_index << 32) + j;
                     seed_offset_vector.push_back(seed_offset); 
-                    if (cfg.transition) {
-                        for (int t=0; t < sa->GetKmerSize(); t++) {
+                    if (cfg.seed.transition) {
+                        for (int t=0; t < cfg.seed.kmer_size; t++) {
                             if (IsTransitionAtPos(t) == 1) {
-                                transition_index = (index ^ (TRANSITION_MASK << (2*t)));
+                                transition_index = (kmer_index ^ (TRANSITION_MASK << (2*t)));
                                 seed_offset = (transition_index << 32) + j;
                                 seed_offset_vector.push_back(seed_offset); 
                             }
@@ -107,10 +110,10 @@ printer_input seeder_body::operator()(seeder_input input) {
 
             if(seed_offset_vector.size() > 0){
                 seeder_body::num_seeds += seed_offset_vector.size();
-                std::vector<segment> anchors = g_SeedAndFilter(seed_offset_vector, true, buffer);
+                std::vector<segmentPair> anchors = g_SeedAndFilter(seed_offset_vector, true, buffer);
                 seeder_body::num_seed_hits += anchors[0].score;
                 if(anchors.size() > 1){
-                    rc_segments.insert(rc_segments.end(), anchors.begin()+1, anchors.end());
+                    rc_hsps.insert(rc_hsps.end(), anchors.begin()+1, anchors.end());
                     seeder_body::num_hsps += anchors.size()-1;
                 }
             }
@@ -120,5 +123,5 @@ printer_input seeder_body::operator()(seeder_input input) {
     seeder_body::num_seeded_regions[buffer] += 1;
     seeder_body::total_xdrop += 1;
 
-    return printer_input(printer_payload(num_invoked, fw_segments, rc_segments, q_block_index, r_start, r_start+r_len-1, q_start, start_pos, end_pos, q_len+cfg.seed_size, r_block_index), token);
+    return printer_input(printer_payload(payload, fw_hsps, rc_hsps), token);
 }
